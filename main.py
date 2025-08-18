@@ -15,7 +15,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.processors.frameworks.rtvi import RTVIProcessor, RTVIObserver
+from pipecat.processors.frameworks.rtvi import RTVIProcessor, RTVIObserver, RTVIConfig
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat_flows import FlowManager
@@ -50,31 +50,37 @@ async def create_services(config):
 
 def create_pipeline_with_rtvi(transport, context_aggregator, llm, tts):
     """Create the processing pipeline with RTVI support."""
-    # Initialize RTVI processor
-    rtvi_processor = RTVIProcessor(transport=transport)
-    rtvi_observer = RTVIObserver(rtvi_processor)
+    # Initialize RTVI processor with proper config (like in the working example)
+    rtvi_processor = RTVIProcessor(config=RTVIConfig(config=[]))
 
-    # Create pipeline with RTVI integration
+    # Create pipeline with RTVI integration - proper order matters!
     pipeline = Pipeline([
         transport.input(),
+        rtvi_processor,  # RTVI processor should come early, right after transport input
         context_aggregator.user(),
         llm,
         tts,
         transport.output(),
         context_aggregator.assistant(),
-        rtvi_processor,  # Add RTVI processor to pipeline
     ])
-
-    # Add RTVI observer
-    pipeline.add_observer(rtvi_observer)
 
     return pipeline, rtvi_processor
 
 
-def setup_rtvi_handlers(rtvi_processor):
+def setup_rtvi_handlers(rtvi_processor, task, context_aggregator):
     """Set up RTVI-specific event handlers."""
+    
+    @rtvi_processor.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        """Handle when RTVI client is ready."""
+        logger.info("🚀 RTVI client ready - setting bot ready state")
+        await rtvi.set_bot_ready()
+        # Kick off the conversation by queuing the initial context
+        await task.queue_frames([context_aggregator.user().get_context_frame()])
+
     @rtvi_processor.event_handler("on_client_message")
     async def on_client_message(processor, message):
+        """Handle RTVI client messages."""
         logger.info(f"📨 Received RTVI client message: {message.type}")
         # Handle specific RTVI client messages if needed
         if hasattr(message, 'data'):
@@ -100,10 +106,7 @@ async def main():
             # Create pipeline with RTVI support
             pipeline, rtvi_processor = create_pipeline_with_rtvi(transport, context_aggregator, llm, tts)
 
-            # Setup RTVI handlers
-            setup_rtvi_handlers(rtvi_processor)
-
-            # Create pipeline task
+            # Create pipeline task with RTVI observer (this is the correct way!)
             task = PipelineTask(
                 pipeline,
                 params=PipelineParams(
@@ -111,7 +114,11 @@ async def main():
                     enable_usage_metrics=config.enable_usage_metrics,
                     allow_interruptions=config.allow_interruptions,
                 ),
+                observers=[RTVIObserver(rtvi_processor)],  # Observer goes on the task, not pipeline
             )
+
+            # Setup RTVI handlers - pass task to handlers so they can queue frames
+            setup_rtvi_handlers(rtvi_processor, task, context_aggregator)
 
             # Initialize flow manager
             flow_manager = FlowManager(
@@ -121,7 +128,7 @@ async def main():
                 tts=tts
             )
 
-            # Setup event handlers
+            # Setup event handlers (your existing transport/task event handlers)
             setup_event_handlers(transport, task, flow_manager)
 
             # Run the bot
