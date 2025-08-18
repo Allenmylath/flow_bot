@@ -1,317 +1,138 @@
 #!/usr/bin/env python3
 
 """
-Interview Flow Module with RTVI Support
+Startup History Collection Bot with RTVI Support - Main Entry Point
 
-Defines the startup interview flow, including data collection,
-flow states, handlers, and node configurations with RTVI push capability.
+A clean, modular chatbot that collects user name and startup history
+using Daily, Cartesia TTS, and OpenAI with flow management and RTVI push capability.
 """
 
 import asyncio
-from typing import Dict
+import aiohttp
 from loguru import logger
-from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
-from pipecat_flows import FlowArgs, FlowManager, FlowResult, NodeConfig
+
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.frameworks.rtvi import RTVIProcessor, RTVIObserver
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat_flows import FlowManager
+
+# Local imports
+from bot_config import get_config, setup_logging
+from daily_setup import create_new_room_and_token, create_daily_transport
+from handlers.event_handlers import setup_event_handlers
+from flows.interview_flow import reset_interview_data
 
 
-class InterviewData:
-    """Centralized data storage for interview information."""
-    
-    def __init__(self):
-        self.name: str = ""
-        self.startup_history: str = ""
-    
-    def to_dict(self) -> Dict[str, str]:
-        """Convert to dictionary for easy access."""
-        return {
-            "name": self.name,
-            "startup_history": self.startup_history
-        }
-    
-    def is_complete(self) -> bool:
-        """Check if all required data has been collected."""
-        return bool(self.name and self.startup_history)
-    
-    def print_summary(self) -> None:
-        """Print formatted summary of collected data."""
-        print("\n" + "=" * 50)
-        print("INTERVIEW SUMMARY")
-        print("=" * 50)
-        print(f"Name: {self.name or 'Not provided'}")
-        print(f"Startup History: {self.startup_history or 'Not provided'}")
-        print("=" * 50 + "\n")
-
-
-# Global interview data instance
-interview_data = InterviewData()
-
-
-# RTVI Helper Function
-async def push_rtvi_data(flow_manager: FlowManager, function_name: str, result: FlowResult, args: FlowArgs, current_node: str = None):
-    """Push collected data via RTVI using task.queue_frame()"""
-    try:
-        data_payload = {
-            "type": "data_collected",
-            "function": function_name,
-            "node": current_node or flow_manager.current_node,
-            "timestamp": asyncio.get_event_loop().time(),
-            "data": {
-                "result": result,
-                "args": args,
-                "interview_data": interview_data.to_dict()
-            }
-        }
-        
-        # Create and queue the RTVI server message frame
-        rtvi_frame = RTVIServerMessageFrame(data=data_payload)
-        await flow_manager.task.queue_frame(rtvi_frame)
-        
-        logger.info(f"✅ Pushed RTVI data for '{function_name}'")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to push RTVI data: {str(e)}")
-
-
-# Flow Result Classes
-class NameCollectionResult(FlowResult):
-    name: str
-
-
-class StartupHistoryResult(FlowResult):
-    startup_history: str
-
-
-class EndCallResult(FlowResult):
-    status: str
-
-
-# Function Handlers (Updated with flow_manager parameter and RTVI push)
-async def collect_name(args: FlowArgs, flow_manager: FlowManager) -> NameCollectionResult:
-    """Process name collection and push data via RTVI."""
-    name = args["name"]
-    logger.debug(f"collect_name handler executing with name: {name}")
-    interview_data.name = name
-    
-    result = NameCollectionResult(name=name)
-    
-    # Push data via RTVI before returning
-    await push_rtvi_data(
-        flow_manager=flow_manager,
-        function_name="collect_name",
-        result=result,
-        args=args,
-        current_node="initial"
+async def create_services(config):
+    """Create and configure all required services."""
+    # Set up Cartesia TTS
+    tts = CartesiaTTSService(
+        api_key=config.cartesia_api_key,
+        voice_id=config.cartesia_voice_id,
     )
-    
-    return result
 
-
-async def collect_startup_history(args: FlowArgs, flow_manager: FlowManager) -> StartupHistoryResult:
-    """Process startup history collection and push data via RTVI."""
-    history = args["startup_history"]
-    logger.debug(f"collect_startup_history handler executing with history: {history}")
-    interview_data.startup_history = history
-    
-    result = StartupHistoryResult(startup_history=history)
-    
-    # Push data via RTVI before returning
-    await push_rtvi_data(
-        flow_manager=flow_manager,
-        function_name="collect_startup_history",
-        result=result,
-        args=args,
-        current_node="startup_history"
+    # Set up OpenAI LLM
+    llm = OpenAILLMService(
+        api_key=config.openai_api_key, 
+        model=config.openai_model
     )
+
+    # Set up conversation context
+    context = OpenAILLMContext()
+    context_aggregator = llm.create_context_aggregator(context)
+
+    return tts, llm, context_aggregator
+
+
+def create_pipeline_with_rtvi(transport, context_aggregator, llm, tts):
+    """Create the processing pipeline with RTVI support."""
+    # Initialize RTVI processor
+    rtvi_processor = RTVIProcessor(transport=transport)
+    rtvi_observer = RTVIObserver(rtvi_processor)
+
+    # Create pipeline with RTVI integration
+    pipeline = Pipeline([
+        transport.input(),
+        context_aggregator.user(),
+        llm,
+        tts,
+        transport.output(),
+        context_aggregator.assistant(),
+        rtvi_processor,  # Add RTVI processor to pipeline
+    ])
+
+    # Add RTVI observer
+    pipeline.add_observer(rtvi_observer)
+
+    return pipeline, rtvi_processor
+
+
+def setup_rtvi_handlers(rtvi_processor):
+    """Set up RTVI-specific event handlers."""
+    @rtvi_processor.event_handler("on_client_message")
+    async def on_client_message(processor, message):
+        logger.info(f"📨 Received RTVI client message: {message.type}")
+        # Handle specific RTVI client messages if needed
+        if hasattr(message, 'data'):
+            logger.debug(f"RTVI message data: {message.data}")
+
+
+async def main():
+    """Main function that orchestrates the entire bot with RTVI support."""
+    # Setup
+    setup_logging()
+    config = get_config()
+    reset_interview_data()  # Start with clean data
     
-    return result
+    async with aiohttp.ClientSession() as session:
+        try:
+            # Create Daily room and transport
+            room_url, token = await create_new_room_and_token(session, config)
+            transport = create_daily_transport(room_url, token, config)
 
+            # Create services
+            tts, llm, context_aggregator = await create_services(config)
 
-async def end_call(args: FlowArgs, flow_manager: FlowManager) -> EndCallResult:
-    """Handle call completion, push final data via RTVI, and print collected data."""
-    logger.info("=== CALL ENDING - COLLECTED DATA ===")
-    data = interview_data.to_dict()
-    logger.info(f"Name: {data['name'] or 'Not provided'}")
-    logger.info(f"Startup History: {data['startup_history'] or 'Not provided'}")
-    logger.info("=====================================")
+            # Create pipeline with RTVI support
+            pipeline, rtvi_processor = create_pipeline_with_rtvi(transport, context_aggregator, llm, tts)
 
-    # Print to console for visibility
-    interview_data.print_summary()
-    
-    result = EndCallResult(status="completed")
-    
-    # Push final data via RTVI
-    await push_rtvi_data(
-        flow_manager=flow_manager,
-        function_name="end_call",
-        result=result,
-        args=args,
-        current_node="summary"
-    )
-    
-    return result
+            # Setup RTVI handlers
+            setup_rtvi_handlers(rtvi_processor)
 
-
-# Transition Callbacks
-async def handle_name_collection(
-    args: Dict, result: NameCollectionResult, flow_manager: FlowManager
-):
-    """Handle transition after name collection."""
-    flow_manager.state["name"] = result["name"]
-    await flow_manager.set_node("startup_history", create_startup_history_node())
-
-
-async def handle_startup_history_collection(
-    args: Dict, result: StartupHistoryResult, flow_manager: FlowManager
-):
-    """Handle transition after startup history collection."""
-    flow_manager.state["startup_history"] = result["startup_history"]
-    await flow_manager.set_node("summary", create_summary_node())
-
-
-async def handle_end_call(args: Dict, result: EndCallResult, flow_manager: FlowManager):
-    """Handle final transition."""
-    await flow_manager.set_node("end", create_end_node())
-
-
-# Node Configuration Functions (Updated handlers to use new signature)
-def create_initial_node() -> NodeConfig:
-    """Create the initial node asking for user's name."""
-    return {
-        "role_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a friendly interviewer collecting information about entrepreneurs "
-                    "and their startup experiences. Your responses will be converted to audio, "
-                    "so keep them conversational and avoid special characters. Always use the "
-                    "available functions to progress the conversation."
+            # Create pipeline task
+            task = PipelineTask(
+                pipeline,
+                params=PipelineParams(
+                    enable_metrics=config.enable_metrics,
+                    enable_usage_metrics=config.enable_usage_metrics,
+                    allow_interruptions=config.allow_interruptions,
                 ),
-            }
-        ],
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Greet the user warmly and ask for their name. Explain that you're "
-                    "conducting a brief interview about their startup experience."
-                ),
-            }
-        ],
-        "functions": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "collect_name",
-                    "handler": collect_name,  # Now uses modern signature with flow_manager
-                    "description": "Record the user's name",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "The user's full name",
-                            }
-                        },
-                        "required": ["name"],
-                    },
-                    "transition_callback": handle_name_collection,
-                },
-            }
-        ],
-    }
+            )
+
+            # Initialize flow manager
+            flow_manager = FlowManager(
+                task=task, 
+                llm=llm, 
+                context_aggregator=context_aggregator, 
+                tts=tts
+            )
+
+            # Setup event handlers
+            setup_event_handlers(transport, task, flow_manager)
+
+            # Run the bot
+            runner = PipelineRunner()
+            logger.info("Starting Startup Interview Bot with RTVI support...")
+            await runner.run(task)
+
+        except Exception as e:
+            logger.error(f"Bot failed to start: {e}")
+            raise
 
 
-def create_startup_history_node() -> NodeConfig:
-    """Create node for collecting startup history."""
-    return {
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Now ask about their startup history. Be encouraging and ask them to share "
-                    "details about any startups they've founded, worked at, or been involved with. "
-                    "Ask about their roles, what the companies did, outcomes, and key learnings."
-                ),
-            }
-        ],
-        "functions": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "collect_startup_history",
-                    "handler": collect_startup_history,  # Now uses modern signature
-                    "description": "Record the user's startup history and experiences",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "startup_history": {
-                                "type": "string",
-                                "description": "Detailed description of the user's startup experience, companies, roles, and outcomes",
-                            }
-                        },
-                        "required": ["startup_history"],
-                    },
-                    "transition_callback": handle_startup_history_collection,
-                },
-            }
-        ],
-    }
-
-
-def create_summary_node() -> NodeConfig:
-    """Create node for summarizing and ending the call."""
-    return {
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Thank the user for sharing their information. Provide a brief, encouraging "
-                    "summary of what they shared. Then ask if there's anything else they'd like "
-                    "to add before ending the call."
-                ),
-            }
-        ],
-        "functions": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "end_call",
-                    "handler": end_call,  # Now uses modern signature
-                    "description": "Complete the interview and end the call",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                    },
-                    "transition_callback": handle_end_call,
-                },
-            }
-        ],
-    }
-
-
-def create_end_node() -> NodeConfig:
-    """Create the final node."""
-    return {
-        "task_messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Give a final thank you and mention that their information has been recorded. "
-                    "End the conversation warmly."
-                ),
-            }
-        ],
-        "functions": [],
-        "post_actions": [{"type": "end_conversation"}],
-    }
-
-
-def get_interview_data() -> InterviewData:
-    """Get the current interview data instance."""
-    return interview_data
-
-
-def reset_interview_data() -> None:
-    """Reset interview data for a new session."""
-    global interview_data
-    interview_data = InterviewData()
+if __name__ == "__main__":
+    asyncio.run(main())
