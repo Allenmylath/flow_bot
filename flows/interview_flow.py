@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 
 """
-Interview Flow Module
+Interview Flow Module with RTVI Support
 
 Defines the startup interview flow, including data collection,
-flow states, handlers, and node configurations.
+flow states, handlers, and node configurations with RTVI push capability.
 """
 
+import asyncio
 from typing import Dict
 from loguru import logger
+from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
 from pipecat_flows import FlowArgs, FlowManager, FlowResult, NodeConfig
 
 
@@ -44,6 +46,32 @@ class InterviewData:
 interview_data = InterviewData()
 
 
+# RTVI Helper Function
+async def push_rtvi_data(flow_manager: FlowManager, function_name: str, result: FlowResult, args: FlowArgs, current_node: str = None):
+    """Push collected data via RTVI using task.queue_frame()"""
+    try:
+        data_payload = {
+            "type": "data_collected",
+            "function": function_name,
+            "node": current_node or flow_manager.current_node,
+            "timestamp": asyncio.get_event_loop().time(),
+            "data": {
+                "result": result,
+                "args": args,
+                "interview_data": interview_data.to_dict()
+            }
+        }
+        
+        # Create and queue the RTVI server message frame
+        rtvi_frame = RTVIServerMessageFrame(data=data_payload)
+        await flow_manager.task.queue_frame(rtvi_frame)
+        
+        logger.info(f"✅ Pushed RTVI data for '{function_name}'")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to push RTVI data: {str(e)}")
+
+
 # Flow Result Classes
 class NameCollectionResult(FlowResult):
     name: str
@@ -57,25 +85,49 @@ class EndCallResult(FlowResult):
     status: str
 
 
-# Function Handlers
-async def collect_name(args: FlowArgs) -> NameCollectionResult:
-    """Process name collection."""
+# Function Handlers (Updated with flow_manager parameter and RTVI push)
+async def collect_name(args: FlowArgs, flow_manager: FlowManager) -> NameCollectionResult:
+    """Process name collection and push data via RTVI."""
     name = args["name"]
     logger.debug(f"collect_name handler executing with name: {name}")
     interview_data.name = name
-    return NameCollectionResult(name=name)
+    
+    result = NameCollectionResult(name=name)
+    
+    # Push data via RTVI before returning
+    await push_rtvi_data(
+        flow_manager=flow_manager,
+        function_name="collect_name",
+        result=result,
+        args=args,
+        current_node="initial"
+    )
+    
+    return result
 
 
-async def collect_startup_history(args: FlowArgs) -> StartupHistoryResult:
-    """Process startup history collection."""
+async def collect_startup_history(args: FlowArgs, flow_manager: FlowManager) -> StartupHistoryResult:
+    """Process startup history collection and push data via RTVI."""
     history = args["startup_history"]
     logger.debug(f"collect_startup_history handler executing with history: {history}")
     interview_data.startup_history = history
-    return StartupHistoryResult(startup_history=history)
+    
+    result = StartupHistoryResult(startup_history=history)
+    
+    # Push data via RTVI before returning
+    await push_rtvi_data(
+        flow_manager=flow_manager,
+        function_name="collect_startup_history",
+        result=result,
+        args=args,
+        current_node="startup_history"
+    )
+    
+    return result
 
 
-async def end_call(args: FlowArgs) -> EndCallResult:
-    """Handle call completion and print collected data."""
+async def end_call(args: FlowArgs, flow_manager: FlowManager) -> EndCallResult:
+    """Handle call completion, push final data via RTVI, and print collected data."""
     logger.info("=== CALL ENDING - COLLECTED DATA ===")
     data = interview_data.to_dict()
     logger.info(f"Name: {data['name'] or 'Not provided'}")
@@ -85,7 +137,18 @@ async def end_call(args: FlowArgs) -> EndCallResult:
     # Print to console for visibility
     interview_data.print_summary()
     
-    return EndCallResult(status="completed")
+    result = EndCallResult(status="completed")
+    
+    # Push final data via RTVI
+    await push_rtvi_data(
+        flow_manager=flow_manager,
+        function_name="end_call",
+        result=result,
+        args=args,
+        current_node="summary"
+    )
+    
+    return result
 
 
 # Transition Callbacks
@@ -110,7 +173,7 @@ async def handle_end_call(args: Dict, result: EndCallResult, flow_manager: FlowM
     await flow_manager.set_node("end", create_end_node())
 
 
-# Node Configuration Functions
+# Node Configuration Functions (Updated handlers to use new signature)
 def create_initial_node() -> NodeConfig:
     """Create the initial node asking for user's name."""
     return {
@@ -139,7 +202,7 @@ def create_initial_node() -> NodeConfig:
                 "type": "function",
                 "function": {
                     "name": "collect_name",
-                    "handler": collect_name,
+                    "handler": collect_name,  # Now uses modern signature with flow_manager
                     "description": "Record the user's name",
                     "parameters": {
                         "type": "object",
@@ -176,7 +239,7 @@ def create_startup_history_node() -> NodeConfig:
                 "type": "function",
                 "function": {
                     "name": "collect_startup_history",
-                    "handler": collect_startup_history,
+                    "handler": collect_startup_history,  # Now uses modern signature
                     "description": "Record the user's startup history and experiences",
                     "parameters": {
                         "type": "object",
@@ -213,7 +276,7 @@ def create_summary_node() -> NodeConfig:
                 "type": "function",
                 "function": {
                     "name": "end_call",
-                    "handler": end_call,
+                    "handler": end_call,  # Now uses modern signature
                     "description": "Complete the interview and end the call",
                     "parameters": {
                         "type": "object",
