@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 """
-Startup History Collection Bot - Main Entry Point
+Startup History Collection Bot with RTVI Support - Main Entry Point
 
 A clean, modular chatbot that collects user name and startup history
-using Daily, Cartesia TTS, and OpenAI with flow management.
+using Daily, Cartesia TTS, and OpenAI with flow management and RTVI push capability.
 """
 
 import asyncio
@@ -15,6 +15,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.frameworks.rtvi import RTVIProcessor, RTVIObserver, RTVIConfig
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat_flows import FlowManager
@@ -35,10 +36,7 @@ async def create_services(config):
     )
 
     # Set up OpenAI LLM
-    llm = OpenAILLMService(
-        api_key=config.openai_api_key, 
-        model=config.openai_model
-    )
+    llm = OpenAILLMService(api_key=config.openai_api_key, model=config.openai_model)
 
     # Set up conversation context
     context = OpenAILLMContext()
@@ -47,61 +45,93 @@ async def create_services(config):
     return tts, llm, context_aggregator
 
 
-def create_pipeline(transport, context_aggregator, llm, tts):
-    """Create the processing pipeline."""
-    return Pipeline([
-        transport.input(),
-        context_aggregator.user(),
-        llm,
-        tts,
-        transport.output(),
-        context_aggregator.assistant(),
-    ])
+def create_pipeline_with_rtvi(transport, context_aggregator, llm, tts):
+    """Create the processing pipeline with RTVI support - following working pattern."""
+    # Create RTVI processor directly in pipeline creation (like working example)
+    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
+    # Create pipeline with RTVI processor right after transport input
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            rtvi,  # RTVI processor immediately after transport input
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
+
+    return pipeline, rtvi
+
+
+def setup_rtvi_handlers(rtvi, task, context_aggregator):
+    """Set up RTVI-specific event handlers AFTER task creation (like working example)."""
+
+    @rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        """Handle when RTVI client is ready."""
+        logger.info("🚀 RTVI client ready - setting bot ready state")
+        await rtvi.set_bot_ready()
+        # Kick off the conversation by queuing the initial context
+        await task.queue_frames([context_aggregator.user().get_context_frame()])
+
+    @rtvi.event_handler("on_client_message")
+    async def on_client_message(processor, message):
+        """Handle RTVI client messages."""
+        logger.info(f"📨 Received RTVI client message: {message.type}")
+        # Handle specific RTVI client messages if needed
+        if hasattr(message, "data"):
+            logger.debug(f"RTVI message data: {message.data}")
 
 
 async def main():
-    """Main function that orchestrates the entire bot."""
+    """Main function that orchestrates the entire bot with RTVI support."""
     # Setup
     setup_logging()
     config = get_config()
     reset_interview_data()  # Start with clean data
-    
+
     async with aiohttp.ClientSession() as session:
         try:
             # Create Daily room and transport
             room_url, token = await create_new_room_and_token(session, config)
             transport = create_daily_transport(room_url, token, config)
 
-            # Create services
+            # Create services (no RTVI processor here)
             tts, llm, context_aggregator = await create_services(config)
 
-            # Create pipeline
-            pipeline = create_pipeline(transport, context_aggregator, llm, tts)
+            # Create pipeline with RTVI processor (created inside pipeline creation)
+            pipeline, rtvi = create_pipeline_with_rtvi(
+                transport, context_aggregator, llm, tts
+            )
 
-            # Create pipeline task
+            # Create pipeline task with RTVI observer
             task = PipelineTask(
                 pipeline,
                 params=PipelineParams(
-                    enable_metrics=config.enable_metrics,
-                    enable_usage_metrics=config.enable_usage_metrics,
+                    enable_metrics=False,  # Disable this temporarily
+                    enable_usage_metrics=False,
                     allow_interruptions=config.allow_interruptions,
                 ),
+                observers=[RTVIObserver(rtvi)],  # Observer for the RTVI processor
             )
+
+            # Setup RTVI handlers AFTER task creation (this is the key!)
+            setup_rtvi_handlers(rtvi, task, context_aggregator)
 
             # Initialize flow manager
             flow_manager = FlowManager(
-                task=task, 
-                llm=llm, 
-                context_aggregator=context_aggregator, 
-                tts=tts
+                task=task, llm=llm, context_aggregator=context_aggregator, tts=tts
             )
 
-            # Setup event handlers
+            # Setup event handlers (your existing transport/task event handlers)
             setup_event_handlers(transport, task, flow_manager)
 
             # Run the bot
             runner = PipelineRunner()
-            logger.info("Starting Startup Interview Bot...")
+            logger.info("Starting Startup Interview Bot with RTVI support...")
             await runner.run(task)
 
         except Exception as e:
