@@ -113,7 +113,7 @@ async def main():
                 params=PipelineParams(
                     enable_metrics=False,  # Disable this temporarily
                     enable_usage_metrics=False,
-                    allow_interruptions=config.allow_interruptions,
+                    
                 ),
                 observers=[RTVIObserver(rtvi)],  # Observer for the RTVI processor
             )
